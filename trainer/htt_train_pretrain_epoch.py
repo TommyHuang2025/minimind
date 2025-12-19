@@ -16,11 +16,13 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+import json
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, iters, checkpoints_dir, start_step=0, wandb=None):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
@@ -77,7 +79,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             torch.save(state_dict, ckp)
             
             # 保存带有epoch信息的resume文件
-            lm_checkpoint(lm_config, weight=f'{args.save_weight}_epoch_{epoch}', model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config, weight=f'{args.save_weight}_epoch_{epoch}', model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir=checkpoints_dir)
             model.train()
             del state_dict
 
@@ -115,10 +117,51 @@ if __name__ == "__main__":
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
+    # 创建基于超参数的、确定性的实验目录
+    lr_str = f"{args.learning_rate:.0e}".replace('e-', 'em')
+    moe_str = '_moe' if args.use_moe else ''
+    experiment_name = f"{args.save_weight}_h{args.hidden_size}_l{args.num_hidden_layers}{moe_str}_bs{args.batch_size}_lr{lr_str}"
+    args.save_dir = os.path.join(args.save_dir, experiment_name)
+    checkpoints_dir = os.path.join(args.save_dir, 'checkpoints')
     os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    # 仅在首次运行时创建并保存配置文件
+    config_path = os.path.join(args.save_dir, 'config.json')
+    if not os.path.exists(config_path) and is_main_process():
+        config_data = vars(args)
+        config_data['timestamp'] = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=4)
+            
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
+    # 从确定的实验目录中查找并加载最新的检查点
+    ckp_data = None
+    if args.from_resume == 1:
+        latest_epoch = -1
+        latest_resume_path = None
+        if os.path.exists(checkpoints_dir):
+            for f in os.listdir(checkpoints_dir):
+                if f.startswith(f'{args.save_weight}_epoch_') and f.endswith('_resume.pth'):
+                    try:
+                        epoch_str = f.split('_epoch_')[1].split('_resume.pth')[0]
+                        epoch_num = int(epoch_str)
+                        if epoch_num > latest_epoch:
+                            latest_epoch = epoch_num
+                            latest_resume_path = os.path.join(checkpoints_dir, f)
+                    except (ValueError, IndexError):
+                        continue
+        
+        if latest_resume_path:
+            Logger(f'从 {latest_resume_path} 恢复训练')
+            ckp_data = torch.load(latest_resume_path, map_location='cpu')
+            saved_ws = ckp_data.get('world_size', 1)
+            current_ws = dist.get_world_size() if dist.is_initialized() else 1
+            if saved_ws != current_ws:
+                ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws
+                Logger(f'GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data["step"]}')
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -148,32 +191,6 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-
-    ckp_data = None
-    if args.from_resume == 1:
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        # 查找最新的epoch检查点
-        latest_epoch = -1
-        latest_resume_path = None
-        for f in os.listdir('../checkpoints'):
-            if f.startswith(f'{args.save_weight}_{lm_config.hidden_size}{moe_suffix}_epoch_') and f.endswith('_resume.pth'):
-                try:
-                    epoch_str = f.split('_epoch_')[1].split('_resume.pth')[0]
-                    epoch_num = int(epoch_str)
-                    if epoch_num > latest_epoch:
-                        latest_epoch = epoch_num
-                        latest_resume_path = os.path.join('../checkpoints', f)
-                except (ValueError, IndexError):
-                    continue
-        
-        if latest_resume_path:
-            Logger(f'从 {latest_resume_path} 恢复训练')
-            ckp_data = torch.load(latest_resume_path, map_location='cpu')
-            saved_ws = ckp_data.get('world_size', 1)
-            current_ws = dist.get_world_size() if dist.is_initialized() else 1
-            if saved_ws != current_ws:
-                ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws
-                Logger(f'GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data["step"]}')
     
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
@@ -187,7 +204,7 @@ if __name__ == "__main__":
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + start_step + 1, checkpoints_dir, start_step, wandb)
         else: # 默认从头开始
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), checkpoints_dir, 0, wandb)
